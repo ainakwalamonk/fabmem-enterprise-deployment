@@ -15,8 +15,8 @@ registry with the credentials issued to you.
 ## Requirements
 
 - Linux host, x86-64, Docker with Compose v2
-- 4 vCPU / 8 GB RAM minimum; disk sized for your source snapshots plus the index
-- The bundled Postgres (recommended — it carries the two required extensions)
+- 2 vCPU / 8 GB RAM minimum; disk sized for your source snapshots plus the index
+- Nothing else. The container hosts its own PostgreSQL 17 — no database to provision
 - Outbound HTTPS to your artifact storage (and to your SSO tenant, if you enable SSO)
 
 ## Install
@@ -24,7 +24,8 @@ registry with the credentials issued to you.
 ```bash
 docker login <registry>                      # credentials issued with your licence
 cp .env.example .env                         # then edit — every required value is marked
-docker compose --profile bundled-db up -d
+docker compose pull
+docker compose up -d
 curl -s localhost:8080/health
 ```
 
@@ -45,28 +46,30 @@ model are present in the image. Compose polls it, so a container that cannot ser
 
 `/health` is separate and deliberately shallow: it answers 200 whenever the process is running.
 
-### Why the database is bundled
+### The database
 
-Two Postgres extensions are required: `vector` (semantic search) and `pg_textsearch` (BM25 keyword ranking).
-`pg_textsearch` needs `shared_preload_libraries` and is not on the extension allowlist of any major managed
-Postgres — checked September 2026 against Azure Flexible Server, RDS and Aurora. The bundled image carries both.
+The container runs its own PostgreSQL 17 with `vector` (semantic search) and `pg_textsearch` (BM25 keyword
+ranking) already provisioned. There is no database service to deploy and no password to manage.
 
+Both extensions are required. `pg_textsearch` needs `shared_preload_libraries` and is not on the extension
+allowlist of any major managed Postgres — checked September 2026 against Azure Flexible Server, RDS and Aurora.
 Pointing `DATABASE_URL` at a managed instance still starts and still answers, but every keyword lane returns
-nothing — the migration logs `pg_textsearch not available - BM25 indexes not created` and continues. Use your own
+nothing: the migration logs `pg_textsearch not available - BM25 indexes not created` and continues. Use your own
 Postgres only where you control the server enough to install the module.
+
+The container runs as uid 10001, not root, because Postgres refuses to `initdb` as root.
 
 ### Storage
 
-By default both the database and the extracted source live in Docker-managed volumes on the host's docker disk.
-For production, bind-mount your own disks — they grow at very different rates, and only the database is
-expensive to lose:
+One volume holds everything that must survive: the database, the extracted source snapshots, the indexer cache
+and the embedding model. It survives container restarts, image upgrades and `docker compose down`; only
+`down -v` destroys it.
 
 ```bash
-FABMEM_DB_PATH=/mnt/fabmem-db      # Postgres — back this up
-FABMEM_DATA_PATH=/mnt/fabmem-data  # extracted source — rebuilt by re-sending builds
+FABMEM_DATA_PATH=/mnt/fabmem-data   # bind-mount your own disk; must be writable by uid 10001
 ```
 
-Both survive container restarts, image upgrades and `docker compose down`. Only `down -v` destroys them.
+Back it up as a unit. The source snapshots are rebuildable by re-sending builds, but the database is not.
 
 ## Sending builds
 
@@ -109,7 +112,9 @@ and each sphere is isolated at the database level.
 
 ## Connecting agents
 
-Point an MCP client at `https://fabmem.internal/mcp` (or `/mcp/<sphere>` for a specific project).
+Point an MCP client at `https://fabmem.internal/mcp` — one endpoint for the whole organisation. Every tool
+takes a `sphere` argument (the id or name from the dashboard's Spheres page) naming the project to query; omit it
+and the deployment's default sphere is used. Each call is authorized against the sphere it names.
 
 **Token mode** (default) — pass `FABMEM_QUERY_TOKEN` as a bearer token. Fine for a small team or an evaluation.
 
@@ -129,8 +134,7 @@ clients, and deriving it from the `Host` header is wrong when a proxy rewrites i
 **Upgrade** — change `FABMEM_IMAGE` to the new tag, then `docker compose pull && docker compose up -d`. Migrations
 apply on boot. Read CHANGELOG.md first; tags are pinned deliberately and never `latest`.
 
-**Backup** — the Postgres volume is the source of truth. The source-snapshot volume is rebuilt by re-sending
-builds, so it does not need backing up.
+**Backup** — the single data volume is the source of truth.
 
 **Logs** — `docker compose logs -f app`. Structured JSON, one object per line.
 
@@ -142,8 +146,11 @@ builds, so it does not need backing up.
 - Source code and indexes stay on your infrastructure. The container makes outbound connections only to the
   artifact URLs you send it and, if SSO is enabled, to your identity provider's public JWKS endpoint.
 - No fabMem-operated telemetry, licence check or phone-home.
-- Two independent credentials: `FABMEM_INGEST_TOKEN` (CI, write) and `FABMEM_QUERY_TOKEN` (developers, read) —
-  the second is replaced by SSO when configured. Rotate by changing `.env` and restarting.
+- Bootstrap credentials `FABMEM_INGEST_TOKEN` (CI, write) and `FABMEM_QUERY_TOKEN` (read) come from `.env`.
+  Once running, issue per-caller API keys from the dashboard instead: revocable individually, last-used
+  recorded, stored as salted scrypt hashes, and rotatable without restarting.
+- With SSO enabled, `WORKOS_ALLOWED_DOMAINS` / `WORKOS_ALLOWED_ORG_ID` are what restrict who may sign in.
+  Leaving both empty admits any authenticated user of that tenant.
 - Terminate TLS in front of the container; it serves plain HTTP on `PORT`.
 - Presigned upload URLs mean no long-lived cloud credentials are held by fabMem.
 

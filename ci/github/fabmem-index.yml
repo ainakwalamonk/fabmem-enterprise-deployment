@@ -1,0 +1,59 @@
+# Ship a built workspace to fabMem after CI builds it.
+#
+# The body is a POINTER, not an upload: fabMem fetches the URL itself, so the artifact must be reachable from the
+# fabMem host. An S3 presigned URL is the usual form — the grant expires on its own and fabMem holds no cloud
+# credentials. This example uses one; any HTTP(S) URL returning a tar archive works.
+#
+# Secrets required:
+#   FABMEM_URL          https://fabmem.yourcompany.com
+#   FABMEM_INGEST_KEY   an `ingest` key issued from the dashboard's API keys page
+#   FABMEM_SPHERE       the sphere id (or name) from the dashboard's Spheres page
+name: fabmem-index
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  index:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Build the workspace. fabMem does NOT build or fetch dependencies — it resolves symbols against exactly
+      # what you send, so dependencies must be installed and artifacts present before the tar.
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - run: npm ci && npm run build
+
+      # Archive the CONTENTS, not the directory: `tar czf x.tgz .` — a tar containing a top-level folder puts the
+      # project one level below the repo root, the indexer finds no build root, and the build reports success with
+      # zero symbols.
+      - name: Archive the built workspace
+        run: tar czf /tmp/build.tgz --exclude='.git' .
+
+      - name: Upload and presign
+        id: artifact
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          BUCKET: ${{ secrets.FABMEM_ARTIFACT_BUCKET }}
+        run: |
+          aws s3 cp /tmp/build.tgz "s3://$BUCKET/${GITHUB_SHA}.tgz"
+          URL=$(aws s3 presign "s3://$BUCKET/${GITHUB_SHA}.tgz" --expires-in 3600)
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: Send the build to fabMem
+        env:
+          FABMEM_URL: ${{ secrets.FABMEM_URL }}
+          FABMEM_INGEST_KEY: ${{ secrets.FABMEM_INGEST_KEY }}
+          FABMEM_SPHERE: ${{ secrets.FABMEM_SPHERE }}
+          ARTIFACT_URL: ${{ steps.artifact.outputs.url }}
+        run: |
+          RESP=$(curl -fsS -X POST "$FABMEM_URL/ingest/build?sphere=$FABMEM_SPHERE" \
+            -H "authorization: Bearer $FABMEM_INGEST_KEY" \
+            -H 'content-type: application/json' \
+            -d "$(jq -nc --arg u "$ARTIFACT_URL" --arg r "$GITHUB_REPOSITORY" --arg c "$GITHUB_SHA" \
+                   '{url:$u, repo:$r, commit:$c}')")
+          echo "$RESP"
+          echo "$RESP" | jq -e '.buildId' >/dev/null

@@ -1,57 +1,47 @@
 # fabMem enterprise — self-hosted stack.
 #
 #   cp .env.example .env && $EDITOR .env
-#   docker compose up -d                        # your own Postgres (DATABASE_URL set)
-#   docker compose --profile bundled-db up -d   # bundled Postgres (evaluation / air-gapped)
+#   docker login <registry>          # credentials issued with your licence
+#   docker compose up -d
 #
-# The image is pulled from a private registry; `docker login` first with the credentials issued to you.
+# ONE container. It hosts its own PostgreSQL 17 (with pgvector + pg_textsearch already provisioned) inside the
+# image, storing the database on the `fabmem-data` volume. There is no database service to run, no password to
+# set, and no managed-Postgres extension problem to work around.
+#
+# To use an EXTERNAL Postgres instead, set DATABASE_URL — the server then leaves its own database unstarted. That
+# server must carry BOTH `vector` and `pg_textsearch`, or every keyword/BM25 lane silently returns nothing.
 
 services:
-  # Bundled Postgres. Only started with `--profile bundled-db`. Omit the profile and nothing here runs,
-  # so pointing DATABASE_URL at RDS/Cloud SQL costs no local container.
-  db:
-    profiles: ["bundled-db"]
-    image: ${FABMEM_DB_IMAGE:?set FABMEM_DB_IMAGE — needs BOTH pgvector and pg_textsearch}
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: fabmem
-      POSTGRES_PASSWORD: ${FABMEM_DB_PASSWORD:?set FABMEM_DB_PASSWORD in .env (openssl rand -hex 24)}
-      POSTGRES_DB: fabmem
-    # pg_textsearch requires shared_preload_libraries; it must be set at server start.
-    command: ["postgres", "-c", "shared_preload_libraries=pg_textsearch"]
-    volumes:
-      - ${FABMEM_DB_PATH:-pgdata}:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U fabmem -d fabmem"]
-      interval: 5s
-      timeout: 3s
-      retries: 30
-
   app:
     image: ${FABMEM_IMAGE:?set FABMEM_IMAGE in .env to a pinned tag}
     restart: unless-stopped
     environment:
-      # Your Postgres when DATABASE_URL is set; otherwise the bundled service. Schema migrations
-      # apply automatically at boot and the container exits if the database is unreachable.
-      DATABASE_URL: ${DATABASE_URL:-postgres://fabmem:${FABMEM_DB_PASSWORD}@db:5432/fabmem}
-      FABRIC_APP_PASSWORD: ${FABRIC_APP_PASSWORD:?set FABRIC_APP_PASSWORD in .env}
-      PORT: "8080"
-      DATA_DIR: ${DATA_DIR:-/data}
+      # Unset = host our own Postgres on the volume below (the supported default).
+      DATABASE_URL: ${DATABASE_URL:-}
 
-      # Service tokens — no defaults, both required.
+      PORT: "8080"
+      DATA_DIR: /data
+
+      # CI credential for POST /ingest/build. A bootstrap value: once the dashboard has issued API keys, those
+      # are per-caller, revocable, and stored as scrypt hashes — prefer them and keep this only for first setup.
       FABMEM_INGEST_TOKEN: ${FABMEM_INGEST_TOKEN:?set FABMEM_INGEST_TOKEN in .env (openssl rand -hex 32)}
+
+      # Fallback for /mcp and the dashboard, used ONLY while WORKOS_ISSUER is unset.
       FABMEM_QUERY_TOKEN: ${FABMEM_QUERY_TOKEN:?set FABMEM_QUERY_TOKEN in .env (openssl rand -hex 32)}
 
-      # SSO for /mcp. Empty WORKOS_ISSUER leaves the static-token lane in effect.
+      # SSO. Setting WORKOS_ISSUER switches /mcp and the dashboard to WorkOS AuthKit.
       WORKOS_ISSUER: ${WORKOS_ISSUER:-}
       WORKOS_CLIENT_ID: ${WORKOS_CLIENT_ID:-}
+      WORKOS_API_KEY: ${WORKOS_API_KEY:-}
       WORKOS_ALLOWED_DOMAINS: ${WORKOS_ALLOWED_DOMAINS:-}
       WORKOS_ALLOWED_ORG_ID: ${WORKOS_ALLOWED_ORG_ID:-}
       FABMEM_MCP_RESOURCE_URL: ${FABMEM_MCP_RESOURCE_URL:-}
     ports:
       - "${FABMEM_HOST_PORT:-8080}:8080"
     volumes:
-      - ${FABMEM_DATA_PATH:-repodata}:/data
+      # HOME is /data inside the image, so this ONE volume holds the database (.fabmem/pgdata), the extracted
+      # source snapshots, the indexer cache and the embedding model. Losing it loses the index.
+      - ${FABMEM_DATA_PATH:-fabmem-data}:/data
     healthcheck:
       # /ready, not /health: /health only proves the process is up. /ready answers 503 until the extensions,
       # schema, storage and model all check out, so a misconfiguration shows as an UNHEALTHY container.
@@ -59,8 +49,7 @@ services:
       interval: 15s
       timeout: 5s
       retries: 5
-      start_period: 30s
+      start_period: 60s
 
 volumes:
-  pgdata:
-  repodata:
+  fabmem-data:
