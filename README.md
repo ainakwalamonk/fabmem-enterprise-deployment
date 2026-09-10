@@ -19,6 +19,23 @@ registry with the credentials issued to you.
 - Nothing else. The container hosts its own PostgreSQL 17 — no database to provision
 - Outbound HTTPS to your artifact storage (and to your SSO tenant, if you enable SSO)
 
+**For SSO (recommended for any shared deployment)** — a WorkOS account with an AuthKit application:
+
+| Requirement | Where it comes from |
+|---|---|
+| AuthKit domain | Authentication → AuthKit → **AuthKit domain** → `WORKOS_ISSUER` |
+| Application client id | Applications → your app → **Client ID** → `WORKOS_CLIENT_ID` |
+| API secret key | API Keys → **Secret key** → `WORKOS_API_KEY` |
+| Redirect URI registered | `https://<your-host>/auth/callback`, added under **Redirects** |
+| Dynamic Client Registration enabled | Applications → Configuration — required for remote MCP clients |
+| A sign-in restriction | `WORKOS_ALLOWED_DOMAINS` and/or `WORKOS_ALLOWED_ORG_ID` |
+
+Leaving both restrictions empty admits **any** authenticated user of that WorkOS tenant. Full setup and
+verification steps: **[SSO.md](SSO.md)**.
+
+Without SSO the deployment falls back to the shared `FABMEM_QUERY_TOKEN` for `/mcp` and the dashboard, which has
+no per-user identity and no sphere-level access control.
+
 ## Install
 
 ```bash
@@ -120,7 +137,8 @@ and the deployment's default sphere is used. Each call is authorized against the
 
 **SSO mode** — set `WORKOS_ISSUER` in `.env`. `/mcp` then requires a WorkOS AuthKit token, developers sign in with
 Google in their client, and there are no shared tokens to distribute or rotate. The server publishes OAuth
-discovery at `/.well-known/oauth-protected-resource`; compatible clients find the login flow on their own.
+discovery at `/.well-known/oauth-protected-resource`; compatible clients register themselves via Dynamic Client
+Registration and find the login flow on their own. See [SSO.md](SSO.md) for what to configure in WorkOS.
 
 ```bash
 claude mcp add --scope user --transport http fabmem https://fabmem.internal/mcp

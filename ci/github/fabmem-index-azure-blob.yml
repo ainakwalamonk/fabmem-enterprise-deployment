@@ -1,0 +1,57 @@
+# Index this repo into fabMem on every push to main. Azure Blob variant — see fabmem-index.yml for S3.
+#
+# Verified end to end on GitHub-hosted runners against a live deployment: the run uploads the archive, presigns
+# it, POSTs the pointer, and the deployment provisions the sphere by name and indexes the build.
+#
+# The POST body is a POINTER, not an upload: fabMem fetches the URL itself, so the artifact must be reachable
+# from the fabMem host and the grant must expire on its own. A SAS URL does both, and fabMem holds no cloud
+# credentials of its own.
+name: fabmem-index
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  index:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Archive the CONTENTS, not the directory. A tar containing a top-level folder puts the project one level
+      # below the repo root, the indexer finds no build root, and the build reports success with ZERO symbols.
+      - name: Archive the built workspace
+        run: tar czf /tmp/build.tgz --exclude='.git' --exclude='.github' .
+
+      - name: Upload and generate a SAS URL
+        id: artifact
+        env:
+          AZURE_STORAGE_ACCOUNT: ${{ secrets.FABMEM_STORAGE_ACCOUNT }}
+          AZURE_STORAGE_KEY: ${{ secrets.FABMEM_STORAGE_KEY }}
+        run: |
+          set -euo pipefail
+          BLOB="${GITHUB_SHA}.tgz"
+          az storage blob upload --account-name "$AZURE_STORAGE_ACCOUNT" --account-key "$AZURE_STORAGE_KEY" \
+            -c builds -n "$BLOB" -f /tmp/build.tgz --overwrite -o none
+          EXPIRY=$(date -u -d '+1 hour' '+%Y-%m-%dT%H:%MZ')
+          SAS=$(az storage blob generate-sas --account-name "$AZURE_STORAGE_ACCOUNT" --account-key "$AZURE_STORAGE_KEY" \
+            -c builds -n "$BLOB" --permissions r --expiry "$EXPIRY" --https-only -o tsv)
+          echo "::add-mask::$SAS"
+          echo "url=https://$AZURE_STORAGE_ACCOUNT.blob.core.windows.net/builds/$BLOB?$SAS" >> "$GITHUB_OUTPUT"
+
+      - name: Send the build to fabMem
+        env:
+          FABMEM_URL: ${{ secrets.FABMEM_URL }}
+          FABMEM_INGEST_KEY: ${{ secrets.FABMEM_INGEST_KEY }}
+          FABMEM_SPHERE: ${{ secrets.FABMEM_SPHERE }}
+          ARTIFACT_URL: ${{ steps.artifact.outputs.url }}
+        run: |
+          set -euo pipefail
+          RESP=$(curl -fsS -X POST "$FABMEM_URL/ingest/build?sphere=$FABMEM_SPHERE" \
+            -H "authorization: Bearer $FABMEM_INGEST_KEY" \
+            -H 'content-type: application/json' \
+            -d "$(jq -nc --arg u "$ARTIFACT_URL" --arg r "$GITHUB_REPOSITORY" --arg c "$GITHUB_SHA" \
+                   '{url:$u, repo:$r, commit:$c}')")
+          echo "$RESP"
+          echo "$RESP" | jq -e '.buildId' > /dev/null
