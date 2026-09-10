@@ -1,0 +1,7 @@
+# real configuration — never committed
+.env
+.env.*
+!.env.example
+
+# local state
+*.log

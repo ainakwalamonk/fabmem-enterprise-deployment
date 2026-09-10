@@ -1,0 +1,66 @@
+# fabMem enterprise — self-hosted stack.
+#
+#   cp .env.example .env && $EDITOR .env
+#   docker compose up -d                        # your own Postgres (DATABASE_URL set)
+#   docker compose --profile bundled-db up -d   # bundled Postgres (evaluation / air-gapped)
+#
+# The image is pulled from a private registry; `docker login` first with the credentials issued to you.
+
+services:
+  # Bundled Postgres. Only started with `--profile bundled-db`. Omit the profile and nothing here runs,
+  # so pointing DATABASE_URL at RDS/Cloud SQL costs no local container.
+  db:
+    profiles: ["bundled-db"]
+    image: ${FABMEM_DB_IMAGE:?set FABMEM_DB_IMAGE — needs BOTH pgvector and pg_textsearch}
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: fabmem
+      POSTGRES_PASSWORD: ${FABMEM_DB_PASSWORD:?set FABMEM_DB_PASSWORD in .env (openssl rand -hex 24)}
+      POSTGRES_DB: fabmem
+    # pg_textsearch requires shared_preload_libraries; it must be set at server start.
+    command: ["postgres", "-c", "shared_preload_libraries=pg_textsearch"]
+    volumes:
+      - ${FABMEM_DB_PATH:-pgdata}:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fabmem -d fabmem"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  app:
+    image: ${FABMEM_IMAGE:?set FABMEM_IMAGE in .env to a pinned tag}
+    restart: unless-stopped
+    environment:
+      # Your Postgres when DATABASE_URL is set; otherwise the bundled service. Schema migrations
+      # apply automatically at boot and the container exits if the database is unreachable.
+      DATABASE_URL: ${DATABASE_URL:-postgres://fabmem:${FABMEM_DB_PASSWORD}@db:5432/fabmem}
+      FABRIC_APP_PASSWORD: ${FABRIC_APP_PASSWORD:?set FABRIC_APP_PASSWORD in .env}
+      PORT: "8080"
+      DATA_DIR: ${DATA_DIR:-/data}
+
+      # Service tokens — no defaults, both required.
+      FABMEM_INGEST_TOKEN: ${FABMEM_INGEST_TOKEN:?set FABMEM_INGEST_TOKEN in .env (openssl rand -hex 32)}
+      FABMEM_QUERY_TOKEN: ${FABMEM_QUERY_TOKEN:?set FABMEM_QUERY_TOKEN in .env (openssl rand -hex 32)}
+
+      # SSO for /mcp. Empty WORKOS_ISSUER leaves the static-token lane in effect.
+      WORKOS_ISSUER: ${WORKOS_ISSUER:-}
+      WORKOS_CLIENT_ID: ${WORKOS_CLIENT_ID:-}
+      WORKOS_ALLOWED_DOMAINS: ${WORKOS_ALLOWED_DOMAINS:-}
+      WORKOS_ALLOWED_ORG_ID: ${WORKOS_ALLOWED_ORG_ID:-}
+      FABMEM_MCP_RESOURCE_URL: ${FABMEM_MCP_RESOURCE_URL:-}
+    ports:
+      - "${FABMEM_HOST_PORT:-8080}:8080"
+    volumes:
+      - ${FABMEM_DATA_PATH:-repodata}:/data
+    healthcheck:
+      # /ready, not /health: /health only proves the process is up. /ready answers 503 until the extensions,
+      # schema, storage and model all check out, so a misconfiguration shows as an UNHEALTHY container.
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:8080/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  pgdata:
+  repodata:
